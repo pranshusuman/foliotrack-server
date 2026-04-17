@@ -179,39 +179,121 @@ app.post('/api/portfolio/import', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// PRICES — Yahoo Finance (free, no key needed)
+// PRICES — Multiple sources with fallback (Yahoo, Stooq, AI)
 // ══════════════════════════════════════════════════════════════════════════
+
+// Try Yahoo Finance query2 endpoint (better headers)
+async function fetchFromYahoo(ticker, exchange) {
+  let symbol = ticker;
+  if (exchange === 'NSE') symbol = ticker + '.NS';
+  else if (exchange === 'BSE') symbol = ticker + '.BO';
+
+  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9'
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!resp.ok) throw new Error('Yahoo HTTP ' + resp.status);
+  const data = await resp.json();
+  const meta = data?.chart?.result?.[0]?.meta;
+  if (!meta) throw new Error('Yahoo no data');
+  return {
+    ltp: meta.regularMarketPrice || meta.previousClose,
+    prev_close: meta.previousClose,
+    day_change_pct: meta.previousClose
+      ? ((meta.regularMarketPrice - meta.previousClose) / meta.previousClose) * 100
+      : 0,
+    currency: meta.currency,
+    market_state: meta.marketState,
+    source: 'yahoo'
+  };
+}
+
+// Fallback: Stooq (free, no auth, very reliable)
+async function fetchFromStooq(ticker, exchange) {
+  let symbol = ticker.toLowerCase();
+  if (exchange === 'NSE') symbol = ticker.toLowerCase() + '.in';
+  else if (exchange === 'BSE') symbol = ticker.toLowerCase() + '.in';
+  else if (exchange === 'NYSE' || exchange === 'NASDAQ') symbol = ticker.toLowerCase() + '.us';
+
+  const url = `https://stooq.com/q/l/?s=${symbol}&f=sd2t2ohlcv&h&e=csv`;
+  const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!resp.ok) throw new Error('Stooq HTTP ' + resp.status);
+  const text = await resp.text();
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) throw new Error('Stooq no data');
+  const cols = lines[1].split(',');
+  const close = parseFloat(cols[6]);
+  const open = parseFloat(cols[3]);
+  if (!close || isNaN(close)) throw new Error('Stooq invalid data');
+  return {
+    ltp: close,
+    prev_close: open,
+    day_change_pct: open ? ((close - open) / open) * 100 : 0,
+    currency: 'INR',
+    market_state: 'UNKNOWN',
+    source: 'stooq'
+  };
+}
+
+// Last resort: use Anthropic AI to search the web
+async function fetchFromAI(ticker, exchange) {
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{
+        role: 'user',
+        content: `Current stock price and today's % change for ${ticker} on ${exchange}. Return ONLY this JSON: {"ltp":0.0,"day_change_pct":0.0}. No markdown.`
+      }]
+    });
+    const text = response.content.filter(c => c.type === 'text').map(c => c.text).join('');
+    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    return {
+      ltp: parsed.ltp,
+      prev_close: parsed.ltp / (1 + parsed.day_change_pct / 100),
+      day_change_pct: parsed.day_change_pct,
+      currency: 'INR',
+      market_state: 'UNKNOWN',
+      source: 'ai'
+    };
+  } catch (e) {
+    throw new Error('AI fetch failed: ' + e.message);
+  }
+}
+
 app.post('/api/prices', auth, async (req, res) => {
   try {
-    const { tickers } = req.body; // [{ ticker, exchange }]
+    const { tickers } = req.body;
     const results = {};
 
     await Promise.all(tickers.map(async ({ ticker, exchange }) => {
-      // Build Yahoo Finance symbol
-      let symbol = ticker;
-      if (exchange === 'NSE') symbol = ticker + '.NS';
-      else if (exchange === 'BSE') symbol = ticker + '.BO';
-
+      // Try Yahoo first (fastest, most data)
       try {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`;
-        const resp = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const data = await resp.json();
-        const meta = data?.chart?.result?.[0]?.meta;
-        if (meta) {
-          results[ticker] = {
-            ltp: meta.regularMarketPrice || meta.previousClose,
-            prev_close: meta.previousClose,
-            day_change_pct: meta.previousClose
-              ? ((meta.regularMarketPrice - meta.previousClose) / meta.previousClose) * 100
-              : 0,
-            currency: meta.currency,
-            market_state: meta.marketState
-          };
-        }
-      } catch (e) {
-        console.error(`Price fetch failed for ${ticker}:`, e.message);
+        results[ticker] = await fetchFromYahoo(ticker, exchange);
+        return;
+      } catch (e1) {
+        console.log(`Yahoo failed for ${ticker}: ${e1.message}, trying Stooq...`);
+      }
+
+      // Fallback to Stooq
+      try {
+        results[ticker] = await fetchFromStooq(ticker, exchange);
+        return;
+      } catch (e2) {
+        console.log(`Stooq failed for ${ticker}: ${e2.message}, trying AI...`);
+      }
+
+      // Last resort: AI
+      try {
+        results[ticker] = await fetchFromAI(ticker, exchange);
+      } catch (e3) {
+        console.error(`All price sources failed for ${ticker}`);
       }
     }));
 
