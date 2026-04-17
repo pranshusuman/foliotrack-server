@@ -165,6 +165,40 @@ app.delete('/api/portfolio/transaction/:id', auth, async (req, res) => {
   res.json({ success: true });
 });
 
+// Edit a holding (update qty, avg cost, or buy date)
+app.patch('/api/portfolio/holding/:id', auth, async (req, res) => {
+  try {
+    const { qty, avg_cost, buy_date } = req.body;
+    const updates = {};
+    if (qty !== undefined) updates.qty = qty;
+    if (avg_cost !== undefined) updates.avg_cost = avg_cost;
+    if (buy_date !== undefined) updates.buy_date = buy_date;
+    const { data, error } = await supabase.from('holdings')
+      .update(updates).eq('id', req.params.id).eq('user_id', req.user.id).select().single();
+    if (error) throw error;
+    res.json({ success: true, holding: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete a holding entirely (also removes related transactions)
+app.delete('/api/portfolio/holding/:id', auth, async (req, res) => {
+  try {
+    const { data: holding } = await supabase.from('holdings')
+      .select('*').eq('id', req.params.id).eq('user_id', req.user.id).single();
+    if (!holding) return res.status(404).json({ error: 'Holding not found' });
+    // Delete related transactions
+    await supabase.from('transactions').delete()
+      .eq('user_id', req.user.id).eq('ticker', holding.ticker).eq('exchange', holding.exchange);
+    // Delete the holding
+    await supabase.from('holdings').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Bulk import (from file upload parsing)
 app.post('/api/portfolio/import', auth, async (req, res) => {
   try {
