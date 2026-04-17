@@ -20,8 +20,19 @@ app.use(express.json());
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const mailer = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASS }
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true,
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASS?.replace(/\s/g, '') },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 15000
+});
+
+// Verify email connection on startup
+mailer.verify((err, success) => {
+  if (err) console.error('❌ Email connection failed:', err.message);
+  else console.log('✅ Email server ready');
 });
 
 // ── Auth middleware ────────────────────────────────────────────────────────
