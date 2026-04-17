@@ -323,15 +323,49 @@ app.post('/api/ai/parse-file', auth, async (req, res) => {
   try {
     const { base64, mediaType } = req.body;
     const isImg = mediaType.startsWith('image/');
-    const content = isImg
-      ? [{ type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } }, { type: 'text', text: 'Extract stock holdings from this image. Return ONLY a JSON array: [{"ticker":"","exchange":"NSE","qty":0,"avgCost":0,"buyDate":""}]. Set null for any missing value. Never assume prices.' }]
-      : [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }, { type: 'text', text: 'Extract stock holdings. Return ONLY JSON array: [{"ticker":"","exchange":"NSE","qty":0,"avgCost":0,"buyDate":""}]. Set null for any missing value.' }];
+    const prompt = `You are looking at a portfolio/holdings spreadsheet or screenshot. Extract ALL stock holdings visible.
 
-    const response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages: [{ role: 'user', content }] });
+For each row, identify:
+- ticker: The stock name. If it's a short/informal name like "skygold" or "concord", convert it to the full NSE ticker symbol (e.g. "skygold" → "SKYGOLD", "concord" → "CONCORDBIO"). Keep it UPPERCASE.
+- exchange: "NSE" for Indian stocks unless clearly NYSE/NASDAQ/BSE
+- qty: The quantity/shares column (as a number)
+- avgCost: The buy price / cost per share (as a number)
+- buyDate: The buy date in YYYY-MM-DD format, or null if not shown
+
+Return ONLY a valid JSON array, no markdown, no explanation, nothing else:
+[{"ticker":"RELIANCE","exchange":"NSE","qty":100,"avgCost":2400.50,"buyDate":null}]
+
+If the image is unclear or has no stock data, return: []`;
+
+    const content = isImg
+      ? [{ type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } }, { type: 'text', text: prompt }]
+      : [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }, { type: 'text', text: prompt }];
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      messages: [{ role: 'user', content }]
+    });
     const text = response.content.filter(c => c.type === 'text').map(c => c.text).join('');
-    const parsed = JSON.parse(text.replace(/```json|```/g, '').trim());
+    console.log('AI raw response:', text.substring(0, 500));
+
+    // Try to extract JSON array even if surrounded by other text
+    let cleaned = text.replace(/```json|```/g, '').trim();
+    const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+    if (jsonMatch) cleaned = jsonMatch[0];
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.error('JSON parse failed. Raw text:', text);
+      return res.status(500).json({ error: 'AI returned unreadable data. The image might be too blurry or complex. Try a clearer screenshot or add stocks manually.' });
+    }
+
+    if (!Array.isArray(parsed)) parsed = [];
     res.json({ holdings: parsed });
   } catch (e) {
+    console.error('Parse-file error:', e);
     res.status(500).json({ error: 'Could not parse file: ' + e.message });
   }
 });
