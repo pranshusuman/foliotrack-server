@@ -7,7 +7,6 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cron = require('node-cron');
-const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
 const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
@@ -19,21 +18,30 @@ app.use(express.json());
 // ── Clients ────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const mailer = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,
-  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_APP_PASS?.replace(/\s/g, '') },
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000
-});
 
-// Verify email connection on startup
-mailer.verify((err, success) => {
-  if (err) console.error('❌ Email connection failed:', err.message);
-  else console.log('✅ Email server ready');
-});
+// ── Email via Resend API (works reliably on Railway) ──────────────────────
+async function sendEmail({ to, subject, html }) {
+  if (!process.env.RESEND_API_KEY) {
+    console.error('❌ RESEND_API_KEY not set');
+    throw new Error('Email not configured');
+  }
+  const from = process.env.EMAIL_FROM || 'FolioTrack <onboarding@resend.dev>';
+  const resp = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + process.env.RESEND_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ from, to, subject, html })
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error('Resend API error: ' + err);
+  }
+  return resp.json();
+}
+
+console.log('✅ Email configured via Resend');
 
 // ── Auth middleware ────────────────────────────────────────────────────────
 function auth(req, res, next) {
@@ -669,8 +677,7 @@ async function buildAndSendSummary(userId, userEmail, userName) {
 <p style="font-size:11px;color:#94a3b8;text-align:center">FolioTrack · To stop emails, log in → Settings → Notifications</p>
 </body></html>`;
 
-  await mailer.sendMail({
-    from: `FolioTrack <${process.env.EMAIL_USER}>`,
+  await sendEmail({
     to: userEmail,
     subject: `📊 ${userName}'s Portfolio · ${sign(dayPct)}${dayPct.toFixed(2)}% today · ${new Date().toDateString()}`,
     html
