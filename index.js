@@ -13,7 +13,7 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 // ── Clients ────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
