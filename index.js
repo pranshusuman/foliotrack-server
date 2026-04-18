@@ -118,20 +118,22 @@ app.get('/api/portfolio', auth, async (req, res) => {
 // Add transaction (buy or sell)
 app.post('/api/portfolio/transaction', auth, async (req, res) => {
   try {
-    const { ticker, exchange, qty, price, date, type } = req.body;
+    const { ticker, exchange, qty, price, date, type, broker } = req.body;
+    const brokerName = (broker || 'Main').trim();
     if (!ticker || !qty || !price || !date || !type) return res.status(400).json({ error: 'All fields required' });
     if (!price || price <= 0) return res.status(400).json({ error: 'Buy price is required — never assumed' });
 
     // Save transaction
     const { data: tx, error: txErr } = await supabase.from('transactions').insert({
-      user_id: req.user.id, ticker: ticker.toUpperCase(), exchange, qty, price, date, type
+      user_id: req.user.id, ticker: ticker.toUpperCase(), exchange, qty, price, date, type, broker: brokerName
     }).select().single();
     if (txErr) throw txErr;
 
-    // Update holdings
+    // Update holdings (keyed by broker too)
     if (type === 'buy') {
       const { data: existing } = await supabase.from('holdings')
-        .select('*').eq('user_id', req.user.id).eq('ticker', ticker.toUpperCase()).eq('exchange', exchange).single();
+        .select('*').eq('user_id', req.user.id).eq('ticker', ticker.toUpperCase())
+        .eq('exchange', exchange).eq('broker', brokerName).single();
 
       if (existing) {
         const newQty = existing.qty + qty;
@@ -139,12 +141,14 @@ app.post('/api/portfolio/transaction', auth, async (req, res) => {
         await supabase.from('holdings').update({ qty: newQty, avg_cost: newAvg }).eq('id', existing.id);
       } else {
         await supabase.from('holdings').insert({
-          user_id: req.user.id, ticker: ticker.toUpperCase(), exchange, qty, avg_cost: price, buy_date: date
+          user_id: req.user.id, ticker: ticker.toUpperCase(), exchange,
+          qty, avg_cost: price, buy_date: date, broker: brokerName
         });
       }
     } else if (type === 'sell') {
       const { data: existing } = await supabase.from('holdings')
-        .select('*').eq('user_id', req.user.id).eq('ticker', ticker.toUpperCase()).eq('exchange', exchange).single();
+        .select('*').eq('user_id', req.user.id).eq('ticker', ticker.toUpperCase())
+        .eq('exchange', exchange).eq('broker', brokerName).single();
       if (existing) {
         const newQty = existing.qty - qty;
         if (newQty <= 0) await supabase.from('holdings').delete().eq('id', existing.id);
@@ -202,22 +206,49 @@ app.delete('/api/portfolio/holding/:id', auth, async (req, res) => {
 // Bulk import (from file upload parsing)
 app.post('/api/portfolio/import', auth, async (req, res) => {
   try {
-    const { holdings } = req.body; // [{ ticker, exchange, qty, avgCost, buyDate }]
+    const { holdings, broker } = req.body;
+    const brokerName = (broker || 'Main').trim();
     const missing = [];
     for (const h of holdings) {
       if (!h.ticker) continue;
       if (!h.avgCost || h.avgCost <= 0) { missing.push(h.ticker.toUpperCase()); continue; }
       const { data: existing } = await supabase.from('holdings')
-        .select('*').eq('user_id', req.user.id).eq('ticker', h.ticker.toUpperCase()).single();
+        .select('*').eq('user_id', req.user.id).eq('ticker', h.ticker.toUpperCase())
+        .eq('broker', brokerName).single();
       if (!existing) {
         await supabase.from('holdings').insert({
           user_id: req.user.id, ticker: h.ticker.toUpperCase(),
           exchange: h.exchange || 'NSE', qty: h.qty || 0,
-          avg_cost: h.avgCost, buy_date: h.buyDate || new Date().toISOString().split('T')[0]
+          avg_cost: h.avgCost, buy_date: h.buyDate || new Date().toISOString().split('T')[0],
+          broker: brokerName
         });
       }
     }
     res.json({ success: true, imported: holdings.length, missingPrices: missing });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Get list of unique brokers used by this user
+app.get('/api/brokers', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('holdings').select('broker').eq('user_id', req.user.id);
+    const brokers = [...new Set((data || []).map(d => d.broker || 'Main'))];
+    res.json({ brokers: brokers.length ? brokers : ['Main'] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Rename a broker across all holdings & transactions
+app.post('/api/brokers/rename', auth, async (req, res) => {
+  try {
+    const { oldName, newName } = req.body;
+    if (!oldName || !newName) return res.status(400).json({ error: 'Both names required' });
+    await supabase.from('holdings').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
+    await supabase.from('transactions').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
+    res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
