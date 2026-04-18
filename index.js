@@ -297,6 +297,80 @@ app.post('/api/portfolio/import', auth, async (req, res) => {
   }
 });
 
+// BULK TRANSACTION IMPORT — inserts many at once + rebuilds holdings
+// Massive speed improvement: 1 DB call instead of N calls
+app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
+  try {
+    const { transactions: incoming } = req.body;
+    if (!Array.isArray(incoming) || !incoming.length) return res.status(400).json({ error: 'No transactions' });
+
+    // Prepare rows for bulk insert
+    const rows = incoming.map(tx => ({
+      user_id: req.user.id,
+      ticker: String(tx.ticker || '').toUpperCase(),
+      exchange: tx.exchange || 'NSE',
+      qty: Number(tx.qty),
+      price: Number(tx.price),
+      date: tx.date,
+      type: tx.type,
+      broker: (tx.broker || 'Main').trim()
+    })).filter(r => r.ticker && r.qty > 0 && r.price > 0 && r.date && (r.type === 'buy' || r.type === 'sell'));
+
+    if (!rows.length) return res.status(400).json({ error: 'No valid transactions' });
+
+    // Bulk insert — single DB call
+    const { data: inserted, error: insErr } = await supabase.from('transactions').insert(rows).select();
+    if (insErr) throw insErr;
+
+    // Rebuild holdings for affected tickers (in parallel)
+    const affected = new Set();
+    rows.forEach(r => affected.add(`${r.ticker}|${r.exchange}|${r.broker}`));
+
+    await Promise.all([...affected].map(async key => {
+      const [ticker, exchange, broker] = key.split('|');
+      const { data: allTxs } = await supabase.from('transactions')
+        .select('*').eq('user_id', req.user.id)
+        .eq('ticker', ticker).eq('exchange', exchange).eq('broker', broker)
+        .order('date', { ascending: true });
+
+      let netQty = 0, totalCost = 0, totalBuyQty = 0, firstBuyDate = null;
+      (allTxs || []).forEach(t => {
+        if (t.type === 'buy') {
+          netQty += Number(t.qty);
+          totalCost += Number(t.qty) * Number(t.price);
+          totalBuyQty += Number(t.qty);
+          if (!firstBuyDate) firstBuyDate = t.date;
+        } else {
+          netQty -= Number(t.qty);
+        }
+      });
+
+      const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+
+      const { data: holding } = await supabase.from('holdings')
+        .select('*').eq('user_id', req.user.id)
+        .eq('ticker', ticker).eq('exchange', exchange).eq('broker', broker).single();
+
+      if (netQty <= 0) {
+        if (holding) await supabase.from('holdings').delete().eq('id', holding.id);
+      } else if (holding) {
+        await supabase.from('holdings').update({ qty: netQty, avg_cost: avgCost }).eq('id', holding.id);
+      } else {
+        await supabase.from('holdings').insert({
+          user_id: req.user.id, ticker, exchange, broker,
+          qty: netQty, avg_cost: avgCost,
+          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+        });
+      }
+    }));
+
+    res.json({ success: true, imported: inserted.length });
+  } catch (e) {
+    console.error('Bulk import error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Get list of unique brokers used by this user
 app.get('/api/brokers', auth, async (req, res) => {
   try {
