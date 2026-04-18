@@ -163,10 +163,69 @@ app.post('/api/portfolio/transaction', auth, async (req, res) => {
   }
 });
 
-// Delete transaction
+// Delete transaction + auto-recalculate holdings
 app.delete('/api/portfolio/transaction/:id', auth, async (req, res) => {
-  await supabase.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
-  res.json({ success: true });
+  try {
+    // Get the transaction first to know which holding to recalculate
+    const { data: tx } = await supabase.from('transactions')
+      .select('*').eq('id', req.params.id).eq('user_id', req.user.id).single();
+
+    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
+
+    // Delete it
+    await supabase.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
+
+    // Recalculate holding from ALL remaining transactions for this ticker+exchange+broker
+    const { data: remaining } = await supabase.from('transactions')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('ticker', tx.ticker)
+      .eq('exchange', tx.exchange)
+      .eq('broker', tx.broker || 'Main')
+      .order('date', { ascending: true });
+
+    let netQty = 0, totalCost = 0, totalBuyQty = 0;
+    (remaining || []).forEach(t => {
+      if (t.type === 'buy') {
+        netQty += Number(t.qty);
+        totalCost += Number(t.qty) * Number(t.price);
+        totalBuyQty += Number(t.qty);
+      } else if (t.type === 'sell') {
+        netQty -= Number(t.qty);
+      }
+    });
+
+    const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+
+    // Find existing holding
+    const { data: holding } = await supabase.from('holdings')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .eq('ticker', tx.ticker)
+      .eq('exchange', tx.exchange)
+      .eq('broker', tx.broker || 'Main')
+      .single();
+
+    if (netQty <= 0) {
+      // No shares left — delete the holding
+      if (holding) await supabase.from('holdings').delete().eq('id', holding.id);
+    } else if (holding) {
+      // Update existing
+      await supabase.from('holdings').update({ qty: netQty, avg_cost: avgCost }).eq('id', holding.id);
+    } else if (remaining && remaining.length > 0) {
+      // Create (edge case: holding was deleted but transactions remain)
+      await supabase.from('holdings').insert({
+        user_id: req.user.id, ticker: tx.ticker, exchange: tx.exchange,
+        qty: netQty, avg_cost: avgCost, broker: tx.broker || 'Main',
+        buy_date: remaining.find(r => r.type === 'buy')?.date || new Date().toISOString().split('T')[0]
+      });
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Delete tx error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Edit a holding (update qty, avg cost, or buy date)
