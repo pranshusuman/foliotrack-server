@@ -289,7 +289,7 @@ async function fetchFromStooq(ticker, exchange) {
 async function fetchFromAI(ticker, exchange) {
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 300,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
@@ -376,7 +376,7 @@ If the image is unclear or has no stock data, return: []`;
       : [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }, { type: 'text', text: prompt }];
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 2000,
       messages: [{ role: 'user', content }]
     });
@@ -409,7 +409,7 @@ app.post('/api/ai/news', auth, async (req, res) => {
   try {
     const { tickers } = req.body;
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1200,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{ role: 'user', content: `Latest news last 24 hours for: ${tickers.join(', ')}. Give earnings, analyst calls, corporate actions, significant moves. Summarize per stock. Only include stocks with actual news.` }]
@@ -426,7 +426,7 @@ app.post('/api/ai/ask', auth, async (req, res) => {
   try {
     const { question, tickers } = req.body;
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{ role: 'user', content: `My portfolio: ${tickers}. Question: ${question}. Search and answer with current information.` }]
@@ -469,7 +469,7 @@ async function buildAndSendSummary(userId, userEmail, userName) {
   let news = '';
   try {
     const nr = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514', max_tokens: 800,
+      model: 'claude-sonnet-4-6', max_tokens: 800,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{ role: 'user', content: `Latest news for: ${holdings.map(h=>h.ticker).join(', ')}. 1-2 lines per stock, only if there is real news.` }]
     });
