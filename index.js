@@ -255,10 +255,75 @@ app.post('/api/brokers/rename', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// PRICES — Multiple sources with fallback (Yahoo, Stooq, AI)
+// PRICES — NSE API primary, Yahoo/Stooq/AI fallback
 // ══════════════════════════════════════════════════════════════════════════
 
-// Try Yahoo Finance query2 endpoint (better headers)
+// NSE requires a session cookie before you can hit data endpoints.
+// We maintain it in memory and refresh when expired.
+let nseCookies = null;
+let nseCookieTime = 0;
+
+async function getNSECookies() {
+  // Reuse cookies for 5 minutes
+  if (nseCookies && (Date.now() - nseCookieTime) < 5 * 60 * 1000) {
+    return nseCookies;
+  }
+  try {
+    const resp = await fetch('https://www.nseindia.com/get-quotes/equity?symbol=RELIANCE', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+      },
+      signal: AbortSignal.timeout(8000)
+    });
+    const cookies = resp.headers.raw?.()['set-cookie'] || resp.headers.get('set-cookie');
+    if (cookies) {
+      nseCookies = Array.isArray(cookies) ? cookies.map(c => c.split(';')[0]).join('; ') : cookies.split(';')[0];
+      nseCookieTime = Date.now();
+      return nseCookies;
+    }
+  } catch (e) {
+    console.log('NSE cookie fetch failed:', e.message);
+  }
+  return null;
+}
+
+// Primary: NSE India's own API (free, reliable for NSE stocks)
+async function fetchFromNSE(ticker, exchange) {
+  if (exchange !== 'NSE') throw new Error('NSE API only supports NSE stocks');
+
+  const cookies = await getNSECookies();
+  if (!cookies) throw new Error('Could not establish NSE session');
+
+  const url = `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(ticker)}`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.nseindia.com/get-quotes/equity?symbol=' + ticker,
+      'Cookie': cookies,
+      'X-Requested-With': 'XMLHttpRequest'
+    },
+    signal: AbortSignal.timeout(8000)
+  });
+  if (!resp.ok) throw new Error('NSE HTTP ' + resp.status);
+  const data = await resp.json();
+  const info = data?.priceInfo;
+  if (!info || !info.lastPrice) throw new Error('NSE no price data');
+  return {
+    ltp: info.lastPrice,
+    prev_close: info.previousClose,
+    day_change_pct: info.pChange || 0,
+    currency: 'INR',
+    market_state: info.intraDayHighLow ? 'LIVE' : 'CLOSED',
+    source: 'nse'
+  };
+}
+
+// Fallback 1: Yahoo Finance (proxy via query2)
 async function fetchFromYahoo(ticker, exchange) {
   let symbol = ticker;
   if (exchange === 'NSE') symbol = ticker + '.NS';
@@ -289,11 +354,10 @@ async function fetchFromYahoo(ticker, exchange) {
   };
 }
 
-// Fallback: Stooq (free, no auth, very reliable)
+// Fallback 2: Stooq (free, no auth)
 async function fetchFromStooq(ticker, exchange) {
   let symbol = ticker.toLowerCase();
-  if (exchange === 'NSE') symbol = ticker.toLowerCase() + '.in';
-  else if (exchange === 'BSE') symbol = ticker.toLowerCase() + '.in';
+  if (exchange === 'NSE' || exchange === 'BSE') symbol = ticker.toLowerCase() + '.in';
   else if (exchange === 'NYSE' || exchange === 'NASDAQ') symbol = ticker.toLowerCase() + '.us';
 
   const url = `https://stooq.com/q/l/?s=${symbol}&f=sd2t2ohlcv&h&e=csv`;
@@ -316,7 +380,7 @@ async function fetchFromStooq(ticker, exchange) {
   };
 }
 
-// Last resort: use Anthropic AI to search the web
+// Last resort: AI web search
 async function fetchFromAI(ticker, exchange) {
   try {
     const response = await anthropic.messages.create({
@@ -348,29 +412,24 @@ app.post('/api/prices', auth, async (req, res) => {
     const { tickers } = req.body;
     const results = {};
 
+    // Warm up NSE session before parallel fetches
+    await getNSECookies();
+
     await Promise.all(tickers.map(async ({ ticker, exchange }) => {
-      // Try Yahoo first (fastest, most data)
-      try {
-        results[ticker] = await fetchFromYahoo(ticker, exchange);
-        return;
-      } catch (e1) {
-        console.log(`Yahoo failed for ${ticker}: ${e1.message}, trying Stooq...`);
+      // NSE first for NSE stocks (most reliable)
+      if (exchange === 'NSE') {
+        try { results[ticker] = await fetchFromNSE(ticker, exchange); return; }
+        catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}, trying Yahoo...`); }
       }
 
-      // Fallback to Stooq
-      try {
-        results[ticker] = await fetchFromStooq(ticker, exchange);
-        return;
-      } catch (e2) {
-        console.log(`Stooq failed for ${ticker}: ${e2.message}, trying AI...`);
-      }
+      try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
+      catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}, trying Stooq...`); }
 
-      // Last resort: AI
-      try {
-        results[ticker] = await fetchFromAI(ticker, exchange);
-      } catch (e3) {
-        console.error(`All price sources failed for ${ticker}`);
-      }
+      try { results[ticker] = await fetchFromStooq(ticker, exchange); return; }
+      catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}, trying AI...`); }
+
+      try { results[ticker] = await fetchFromAI(ticker, exchange); }
+      catch (e3) { console.error(`All price sources failed for ${ticker}`); }
     }));
 
     res.json(results);
