@@ -298,13 +298,13 @@ app.post('/api/portfolio/import', auth, async (req, res) => {
 });
 
 // BULK TRANSACTION IMPORT — inserts many at once + rebuilds holdings
-// Massive speed improvement: 1 DB call instead of N calls
+// Fixed: sequential holding rebuild to avoid race conditions
 app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
   try {
     const { transactions: incoming } = req.body;
     if (!Array.isArray(incoming) || !incoming.length) return res.status(400).json({ error: 'No transactions' });
 
-    // Prepare rows for bulk insert
+    // Prepare rows
     const rows = incoming.map(tx => ({
       user_id: req.user.id,
       ticker: String(tx.ticker || '').toUpperCase(),
@@ -318,53 +318,86 @@ app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
 
     if (!rows.length) return res.status(400).json({ error: 'No valid transactions' });
 
-    // Bulk insert — single DB call
-    const { data: inserted, error: insErr } = await supabase.from('transactions').insert(rows).select();
-    if (insErr) throw insErr;
+    // Chunk transactions insert (Supabase limit ~1000/call)
+    let insertedCount = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { data: inserted, error: insErr } = await supabase.from('transactions').insert(chunk).select('id');
+      if (insErr) throw insErr;
+      insertedCount += (inserted || []).length;
+    }
 
-    // Rebuild holdings for affected tickers (in parallel)
+    // Collect unique holdings to rebuild
     const affected = new Set();
     rows.forEach(r => affected.add(`${r.ticker}|${r.exchange}|${r.broker}`));
 
-    await Promise.all([...affected].map(async key => {
-      const [ticker, exchange, broker] = key.split('|');
-      const { data: allTxs } = await supabase.from('transactions')
-        .select('*').eq('user_id', req.user.id)
-        .eq('ticker', ticker).eq('exchange', exchange).eq('broker', broker)
-        .order('date', { ascending: true });
+    // Rebuild holdings SEQUENTIALLY to prevent race conditions
+    let holdingsRebuilt = 0, holdingsDeleted = 0, errors = [];
+    for (const key of affected) {
+      try {
+        const [ticker, exchange, broker] = key.split('|');
 
-      let netQty = 0, totalCost = 0, totalBuyQty = 0, firstBuyDate = null;
-      (allTxs || []).forEach(t => {
-        if (t.type === 'buy') {
-          netQty += Number(t.qty);
-          totalCost += Number(t.qty) * Number(t.price);
-          totalBuyQty += Number(t.qty);
-          if (!firstBuyDate) firstBuyDate = t.date;
-        } else {
-          netQty -= Number(t.qty);
-        }
-      });
+        // Fetch ALL transactions for this stock (including any pre-existing ones)
+        const { data: allTxs, error: txErr } = await supabase.from('transactions')
+          .select('type, qty, price, date')
+          .eq('user_id', req.user.id)
+          .eq('ticker', ticker)
+          .eq('exchange', exchange)
+          .eq('broker', broker)
+          .order('date', { ascending: true });
 
-      const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+        if (txErr) throw txErr;
 
-      const { data: holding } = await supabase.from('holdings')
-        .select('*').eq('user_id', req.user.id)
-        .eq('ticker', ticker).eq('exchange', exchange).eq('broker', broker).single();
-
-      if (netQty <= 0) {
-        if (holding) await supabase.from('holdings').delete().eq('id', holding.id);
-      } else if (holding) {
-        await supabase.from('holdings').update({ qty: netQty, avg_cost: avgCost }).eq('id', holding.id);
-      } else {
-        await supabase.from('holdings').insert({
-          user_id: req.user.id, ticker, exchange, broker,
-          qty: netQty, avg_cost: avgCost,
-          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+        // Calculate current net position
+        let netQty = 0, totalBuyCost = 0, totalBuyQty = 0, firstBuyDate = null;
+        (allTxs || []).forEach(t => {
+          const q = Number(t.qty), p = Number(t.price);
+          if (t.type === 'buy') {
+            netQty += q;
+            totalBuyCost += q * p;
+            totalBuyQty += q;
+            if (!firstBuyDate) firstBuyDate = t.date;
+          } else {
+            netQty -= q;
+          }
         });
-      }
-    }));
+        const avgCost = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
 
-    res.json({ success: true, imported: inserted.length });
+        // Delete existing holding first (avoids duplicate key conflict)
+        await supabase.from('holdings')
+          .delete()
+          .eq('user_id', req.user.id)
+          .eq('ticker', ticker)
+          .eq('exchange', exchange)
+          .eq('broker', broker);
+
+        // Insert fresh holding if still positive
+        if (netQty > 0 && avgCost > 0) {
+          const { error: hErr } = await supabase.from('holdings').insert({
+            user_id: req.user.id,
+            ticker, exchange, broker,
+            qty: netQty,
+            avg_cost: avgCost,
+            buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+          });
+          if (hErr) throw hErr;
+          holdingsRebuilt++;
+        } else {
+          holdingsDeleted++;
+        }
+      } catch (err) {
+        errors.push(`${key}: ${err.message}`);
+        console.error(`Failed to rebuild ${key}:`, err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      imported: insertedCount,
+      holdingsRebuilt,
+      holdingsDeleted,
+      errors: errors.slice(0, 10)
+    });
   } catch (e) {
     console.error('Bulk import error:', e);
     res.status(500).json({ error: e.message });
@@ -390,6 +423,19 @@ app.post('/api/brokers/rename', auth, async (req, res) => {
     await supabase.from('holdings').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
     await supabase.from('transactions').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete all data for a specific broker (useful for re-import)
+app.delete('/api/brokers/:name', auth, async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!name) return res.status(400).json({ error: 'Broker name required' });
+    const { count: delTx } = await supabase.from('transactions').delete({ count: 'exact' }).eq('user_id', req.user.id).eq('broker', name);
+    const { count: delH } = await supabase.from('holdings').delete({ count: 'exact' }).eq('user_id', req.user.id).eq('broker', name);
+    res.json({ success: true, transactionsDeleted: delTx || 0, holdingsDeleted: delH || 0 });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
