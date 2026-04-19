@@ -196,76 +196,103 @@ app.post('/api/portfolio/transaction', auth, async (req, res) => {
 // Delete transaction + auto-recalculate holdings
 app.delete('/api/portfolio/transaction/:id', auth, async (req, res) => {
   try {
-    // Get the transaction first to know which holding to recalculate
     const { data: tx } = await supabase.from('transactions')
       .select('*').eq('id', req.params.id).eq('user_id', req.user.id).single();
-
     if (!tx) return res.status(404).json({ error: 'Transaction not found' });
 
-    // Delete it
     await supabase.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
-
-    // Recalculate holding from ALL remaining transactions for this ticker+exchange+broker
-    let remaining = [];
-    let remFrom = 0;
-    while (true) {
-      const { data } = await supabase.from('transactions')
-        .select('*')
-        .eq('user_id', req.user.id)
-        .eq('ticker', tx.ticker)
-        .eq('exchange', tx.exchange)
-        .eq('broker', tx.broker || 'Main')
-        .order('date', { ascending: true })
-        .range(remFrom, remFrom + 999);
-      if (!data || data.length === 0) break;
-      remaining = remaining.concat(data);
-      if (data.length < 1000) break;
-      remFrom += 1000;
-    }
-
-    let netQty = 0, totalCost = 0, totalBuyQty = 0;
-    (remaining || []).forEach(t => {
-      if (t.type === 'buy') {
-        netQty += Number(t.qty);
-        totalCost += Number(t.qty) * Number(t.price);
-        totalBuyQty += Number(t.qty);
-      } else if (t.type === 'sell') {
-        netQty -= Number(t.qty);
-      }
-    });
-
-    const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
-
-    // Find existing holding
-    const { data: holding } = await supabase.from('holdings')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .eq('ticker', tx.ticker)
-      .eq('exchange', tx.exchange)
-      .eq('broker', tx.broker || 'Main')
-      .single();
-
-    if (netQty <= 0) {
-      // No shares left — delete the holding
-      if (holding) await supabase.from('holdings').delete().eq('id', holding.id);
-    } else if (holding) {
-      // Update existing
-      await supabase.from('holdings').update({ qty: netQty, avg_cost: avgCost }).eq('id', holding.id);
-    } else if (remaining && remaining.length > 0) {
-      // Create (edge case: holding was deleted but transactions remain)
-      await supabase.from('holdings').insert({
-        user_id: req.user.id, ticker: tx.ticker, exchange: tx.exchange,
-        qty: netQty, avg_cost: avgCost, broker: tx.broker || 'Main',
-        buy_date: remaining.find(r => r.type === 'buy')?.date || new Date().toISOString().split('T')[0]
-      });
-    }
-
+    await rebuildHoldingForStock(req.user.id, tx.ticker, tx.exchange, tx.broker || 'Main');
     res.json({ success: true });
   } catch (e) {
     console.error('Delete tx error:', e);
     res.status(500).json({ error: e.message });
   }
 });
+
+// Edit transaction + auto-recalculate holdings
+app.patch('/api/portfolio/transaction/:id', auth, async (req, res) => {
+  try {
+    const { ticker, exchange, qty, price, date, type, broker } = req.body;
+
+    // Get original to know old stock grouping (in case ticker/broker changed)
+    const { data: original } = await supabase.from('transactions')
+      .select('*').eq('id', req.params.id).eq('user_id', req.user.id).single();
+    if (!original) return res.status(404).json({ error: 'Transaction not found' });
+
+    const updates = {};
+    if (ticker !== undefined) updates.ticker = String(ticker).toUpperCase();
+    if (exchange !== undefined) updates.exchange = exchange;
+    if (qty !== undefined) updates.qty = Number(qty);
+    if (price !== undefined) updates.price = Number(price);
+    if (date !== undefined) updates.date = date;
+    if (type !== undefined) updates.type = type;
+    if (broker !== undefined) updates.broker = String(broker).trim();
+
+    const { error } = await supabase.from('transactions')
+      .update(updates).eq('id', req.params.id).eq('user_id', req.user.id);
+    if (error) throw error;
+
+    // Rebuild old stock grouping (if ticker/exchange/broker changed)
+    await rebuildHoldingForStock(req.user.id, original.ticker, original.exchange, original.broker || 'Main');
+
+    // Also rebuild new grouping if different
+    const newTicker = updates.ticker || original.ticker;
+    const newExchange = updates.exchange || original.exchange;
+    const newBroker = updates.broker || original.broker || 'Main';
+    if (newTicker !== original.ticker || newExchange !== original.exchange || newBroker !== (original.broker || 'Main')) {
+      await rebuildHoldingForStock(req.user.id, newTicker, newExchange, newBroker);
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Edit tx error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Helper: rebuild a single holding from its transactions
+async function rebuildHoldingForStock(userId, ticker, exchange, broker) {
+  let remaining = [];
+  let remFrom = 0;
+  while (true) {
+    const { data } = await supabase.from('transactions')
+      .select('type, qty, price, date')
+      .eq('user_id', userId).eq('ticker', ticker)
+      .eq('exchange', exchange).eq('broker', broker)
+      .order('date', { ascending: true })
+      .range(remFrom, remFrom + 999);
+    if (!data || data.length === 0) break;
+    remaining = remaining.concat(data);
+    if (data.length < 1000) break;
+    remFrom += 1000;
+  }
+
+  let netQty = 0, totalCost = 0, totalBuyQty = 0, firstBuyDate = null;
+  remaining.forEach(t => {
+    const q = Number(t.qty), p = Number(t.price);
+    if (t.type === 'buy') {
+      netQty += q; totalCost += q * p; totalBuyQty += q;
+      if (!firstBuyDate) firstBuyDate = t.date;
+    } else {
+      netQty -= q;
+    }
+  });
+  const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+
+  // Delete existing then insert if needed (avoids race conditions)
+  await supabase.from('holdings').delete()
+    .eq('user_id', userId).eq('ticker', ticker)
+    .eq('exchange', exchange).eq('broker', broker);
+
+  if (netQty > 0.001 && avgCost > 0) {
+    await supabase.from('holdings').insert({
+      user_id: userId, ticker, exchange, broker,
+      qty: Math.round(netQty * 1000) / 1000,
+      avg_cost: Math.round(avgCost * 100) / 100,
+      buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+    });
+  }
+}
 
 // Edit a holding (update qty, avg cost, or buy date)
 app.patch('/api/portfolio/holding/:id', auth, async (req, res) => {
@@ -559,10 +586,30 @@ app.delete('/api/brokers/:name', auth, async (req, res) => {
   try {
     const name = req.params.name;
     if (!name) return res.status(400).json({ error: 'Broker name required' });
-    const { count: delTx } = await supabase.from('transactions').delete({ count: 'exact' }).eq('user_id', req.user.id).eq('broker', name);
-    const { count: delH } = await supabase.from('holdings').delete({ count: 'exact' }).eq('user_id', req.user.id).eq('broker', name);
-    res.json({ success: true, transactionsDeleted: delTx || 0, holdingsDeleted: delH || 0 });
+
+    // Delete in chunks to bypass Supabase row limits
+    let totalTx = 0;
+    while (true) {
+      const { data: toDelete } = await supabase.from('transactions')
+        .select('id').eq('user_id', req.user.id).eq('broker', name).limit(1000);
+      if (!toDelete || toDelete.length === 0) break;
+      const ids = toDelete.map(t => t.id);
+      await supabase.from('transactions').delete().in('id', ids);
+      totalTx += toDelete.length;
+      if (toDelete.length < 1000) break;
+    }
+
+    // Delete all holdings for this broker
+    const { data: holdings } = await supabase.from('holdings')
+      .select('id').eq('user_id', req.user.id).eq('broker', name);
+    const totalH = (holdings || []).length;
+    if (totalH > 0) {
+      await supabase.from('holdings').delete().in('id', holdings.map(h => h.id));
+    }
+
+    res.json({ success: true, transactionsDeleted: totalTx, holdingsDeleted: totalH });
   } catch (e) {
+    console.error('Delete broker error:', e);
     res.status(500).json({ error: e.message });
   }
 });
