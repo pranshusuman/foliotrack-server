@@ -328,7 +328,94 @@ app.post('/api/portfolio/import', auth, async (req, res) => {
   }
 });
 
-// BULK TRANSACTION IMPORT — inserts many at once + rebuilds holdings
+// REBUILD ALL HOLDINGS from scratch based on ALL transactions
+// Use this when holdings are out of sync with transactions
+app.post('/api/portfolio/rebuild', auth, async (req, res) => {
+  try {
+    console.log(`🔨 Rebuilding all holdings for user ${req.user.id}...`);
+
+    // Step 1: Fetch ALL transactions (paginated)
+    let allTxs = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase
+        .from('transactions').select('*')
+        .eq('user_id', req.user.id)
+        .order('date', { ascending: true })
+        .range(from, from + 999);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      allTxs = allTxs.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    console.log(`Found ${allTxs.length} transactions to process`);
+
+    // Step 2: Group by ticker+exchange+broker
+    const groups = {};
+    allTxs.forEach(t => {
+      const key = `${t.ticker}|${t.exchange}|${t.broker || 'Main'}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    });
+
+    // Step 3: Delete ALL existing holdings
+    await supabase.from('holdings').delete().eq('user_id', req.user.id);
+
+    // Step 4: Recompute and insert fresh holdings
+    let rebuilt = 0, closed = 0;
+    const newHoldings = [];
+
+    for (const [key, txs] of Object.entries(groups)) {
+      const [ticker, exchange, broker] = key.split('|');
+      let netQty = 0, totalBuyCost = 0, totalBuyQty = 0, firstBuyDate = null;
+
+      txs.forEach(t => {
+        const q = Number(t.qty), p = Number(t.price);
+        if (t.type === 'buy') {
+          netQty += q;
+          totalBuyCost += q * p;
+          totalBuyQty += q;
+          if (!firstBuyDate) firstBuyDate = t.date;
+        } else {
+          netQty -= q;
+        }
+      });
+
+      const avgCost = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
+
+      if (netQty > 0.001 && avgCost > 0) {
+        newHoldings.push({
+          user_id: req.user.id,
+          ticker, exchange, broker,
+          qty: Math.round(netQty * 1000) / 1000,
+          avg_cost: Math.round(avgCost * 100) / 100,
+          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+        });
+        rebuilt++;
+      } else {
+        closed++;
+      }
+    }
+
+    // Bulk insert all new holdings
+    if (newHoldings.length > 0) {
+      const chunkSize = 500;
+      for (let i = 0; i < newHoldings.length; i += chunkSize) {
+        const { error } = await supabase.from('holdings').insert(newHoldings.slice(i, i + chunkSize));
+        if (error) throw error;
+      }
+    }
+
+    console.log(`✅ Rebuilt ${rebuilt} holdings, ${closed} fully closed positions`);
+    res.json({ success: true, rebuilt, closed, total: allTxs.length });
+
+  } catch (e) {
+    console.error('Rebuild error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
 // Fixed: sequential holding rebuild to avoid race conditions
 app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
   try {
