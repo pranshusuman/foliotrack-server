@@ -116,11 +116,33 @@ app.get('/api/auth/me', auth, async (req, res) => {
 
 // Get portfolio + transactions
 app.get('/api/portfolio', auth, async (req, res) => {
-  const [{ data: portfolio }, { data: transactions }] = await Promise.all([
-    supabase.from('holdings').select('*').eq('user_id', req.user.id),
-    supabase.from('transactions').select('*').eq('user_id', req.user.id).order('date', { ascending: true })
-  ]);
-  res.json({ portfolio: portfolio || [], transactions: transactions || [] });
+  try {
+    // Fetch holdings (usually small, no limit needed)
+    const { data: portfolio } = await supabase
+      .from('holdings').select('*').eq('user_id', req.user.id);
+
+    // Fetch ALL transactions — Supabase default limit is 1000, must paginate
+    let transactions = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+      const { data, error } = await supabase
+        .from('transactions').select('*')
+        .eq('user_id', req.user.id)
+        .order('date', { ascending: true })
+        .range(from, from + pageSize - 1);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      transactions = transactions.concat(data);
+      if (data.length < pageSize) break; // Last page
+      from += pageSize;
+    }
+
+    res.json({ portfolio: portfolio || [], transactions });
+  } catch (e) {
+    console.error('Portfolio fetch error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Add transaction (buy or sell)
@@ -184,13 +206,22 @@ app.delete('/api/portfolio/transaction/:id', auth, async (req, res) => {
     await supabase.from('transactions').delete().eq('id', req.params.id).eq('user_id', req.user.id);
 
     // Recalculate holding from ALL remaining transactions for this ticker+exchange+broker
-    const { data: remaining } = await supabase.from('transactions')
-      .select('*')
-      .eq('user_id', req.user.id)
-      .eq('ticker', tx.ticker)
-      .eq('exchange', tx.exchange)
-      .eq('broker', tx.broker || 'Main')
-      .order('date', { ascending: true });
+    let remaining = [];
+    let remFrom = 0;
+    while (true) {
+      const { data } = await supabase.from('transactions')
+        .select('*')
+        .eq('user_id', req.user.id)
+        .eq('ticker', tx.ticker)
+        .eq('exchange', tx.exchange)
+        .eq('broker', tx.broker || 'Main')
+        .order('date', { ascending: true })
+        .range(remFrom, remFrom + 999);
+      if (!data || data.length === 0) break;
+      remaining = remaining.concat(data);
+      if (data.length < 1000) break;
+      remFrom += 1000;
+    }
 
     let netQty = 0, totalCost = 0, totalBuyQty = 0;
     (remaining || []).forEach(t => {
@@ -337,16 +368,24 @@ app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
       try {
         const [ticker, exchange, broker] = key.split('|');
 
-        // Fetch ALL transactions for this stock (including any pre-existing ones)
-        const { data: allTxs, error: txErr } = await supabase.from('transactions')
-          .select('type, qty, price, date')
-          .eq('user_id', req.user.id)
-          .eq('ticker', ticker)
-          .eq('exchange', exchange)
-          .eq('broker', broker)
-          .order('date', { ascending: true });
-
-        if (txErr) throw txErr;
+        // Fetch ALL transactions for this stock (paginated)
+        let allTxs = [];
+        let txFrom = 0;
+        while (true) {
+          const { data, error: txErr } = await supabase.from('transactions')
+            .select('type, qty, price, date')
+            .eq('user_id', req.user.id)
+            .eq('ticker', ticker)
+            .eq('exchange', exchange)
+            .eq('broker', broker)
+            .order('date', { ascending: true })
+            .range(txFrom, txFrom + 999);
+          if (txErr) throw txErr;
+          if (!data || data.length === 0) break;
+          allTxs = allTxs.concat(data);
+          if (data.length < 1000) break;
+          txFrom += 1000;
+        }
 
         // Calculate current net position
         let netQty = 0, totalBuyCost = 0, totalBuyQty = 0, firstBuyDate = null;
