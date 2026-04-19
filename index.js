@@ -888,6 +888,55 @@ app.post('/api/ai/ask', auth, async (req, res) => {
   }
 });
 
+// Dedicated ticker lookup — NO web search, returns clean JSON
+app.post('/api/ai/lookup-tickers', auth, async (req, res) => {
+  try {
+    const { names } = req.body;
+    if (!Array.isArray(names) || names.length === 0) return res.json({ map: {} });
+    const list = names.map((n, i) => `${i+1}. ${n}`).join('\n');
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: `Convert these Indian company names to their NSE ticker symbols. Return ONLY a valid JSON object. No markdown, no code fences, no explanation.
+
+Examples of mappings:
+- "State Bank of India" or "SBI" → "SBIN"
+- "Mahindra & Mahindra" or "M&M" → "M&M"
+- "LT Foods" → "DAAWAT"
+- "Reliance Industries" or "Reliance" → "RELIANCE"
+- "Tata Consultancy Services" or "TCS" → "TCS"
+- "HDFC Bank" → "HDFCBANK"
+- "Adani Enterprises" or "Adani Enterpris" → "ADANIENT"
+
+If you cannot confidently identify a ticker, use "UNKNOWN".
+
+Input names:
+${list}
+
+Return format (JSON only, no other text):
+{"Name1":"TICKER1","Name2":"TICKER2",...}`
+      }]
+    });
+    let text = response.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
+    // Strip markdown code fences if present
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    // Extract JSON object if surrounded by other text
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) text = jsonMatch[0];
+    let map = {};
+    try { map = JSON.parse(text); } catch(e) {
+      console.error('Ticker JSON parse failed:', text.substring(0, 200));
+      return res.json({ map: {}, error: 'AI returned invalid JSON' });
+    }
+    res.json({ map });
+  } catch (e) {
+    console.error('Ticker lookup error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════
 // NOTIFICATIONS
 // ══════════════════════════════════════════════════════════════════════════
