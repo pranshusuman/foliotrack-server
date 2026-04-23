@@ -683,7 +683,61 @@ async function fetchFromNSE(ticker, exchange) {
   };
 }
 
-// Fallback 1: Yahoo Finance (proxy via query2)
+// PRIMARY: Dhan Market Feed API (batch — up to 1000 tickers per call)
+const DHAN_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
+const DHAN_CLIENT_ID = process.env.DHAN_CLIENT_ID || '1000000290';
+
+async function fetchFromDhan(tickers) {
+  // tickers: [{ticker, exchange}, ...]
+  if (!DHAN_TOKEN) throw new Error('No Dhan token');
+
+  // Group by segment
+  const nse = tickers.filter(t => t.exchange === 'NSE').map(t => t.ticker);
+  const bse = tickers.filter(t => t.exchange === 'BSE').map(t => t.ticker);
+
+  const body = {};
+  if (nse.length) body['NSE_EQ'] = nse;
+  if (bse.length) body['BSE_EQ'] = bse;
+  if (!Object.keys(body).length) throw new Error('No valid tickers');
+
+  const resp = await fetch('https://api.dhan.co/v2/marketfeed/ltp', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'access-token': DHAN_TOKEN,
+      'client-id': DHAN_CLIENT_ID
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000)
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Dhan HTTP ${resp.status}: ${txt.substring(0, 100)}`);
+  }
+
+  const data = await resp.json();
+  // Response format: { "NSE_EQ": { "RELIANCE": { "last_price": 2400.5 }, ... }, ... }
+  const results = {};
+
+  for (const [segment, stocks] of Object.entries(data)) {
+    for (const [ticker, info] of Object.entries(stocks || {})) {
+      const ltp = info.last_price || info.ltp || 0;
+      const prevClose = info.prev_close || info.close || ltp;
+      const dayPct = prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0;
+      results[ticker] = {
+        ltp, prev_close: prevClose,
+        day_change_pct: Math.round(dayPct * 100) / 100,
+        currency: 'INR',
+        market_state: 'LIVE',
+        source: 'dhan'
+      };
+    }
+  }
+  return results;
+}
+
+// Fallback 1: Yahoo Finance (proxy via query1)
 async function fetchFromYahoo(ticker, exchange) {
   let symbol = ticker;
   if (exchange === 'NSE') symbol = ticker + '.NS';
@@ -774,31 +828,41 @@ app.post('/api/prices', auth, async (req, res) => {
     const { tickers } = req.body;
     const results = {};
 
-    // Try NSE session warmup but don't block on failure
-    getNSECookies().catch(() => {});
-
-    await Promise.all(tickers.map(async ({ ticker, exchange }) => {
-      // Yahoo first — NSE frequently blocks cloud server IPs
-      try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
-      catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}`); }
-
-      // NSE second (may work if not blocked)
-      if (exchange === 'NSE') {
-        try { results[ticker] = await fetchFromNSE(ticker, exchange); return; }
-        catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}`); }
+    // Try Dhan FIRST — batch call for ALL tickers at once (fastest)
+    if (DHAN_TOKEN) {
+      try {
+        const dhanResults = await fetchFromDhan(tickers);
+        Object.assign(results, dhanResults);
+        const found = Object.keys(dhanResults).length;
+        console.log(`Dhan: ${found}/${tickers.length} prices fetched`);
+        // For any tickers Dhan missed, fall through to Yahoo below
+      } catch (e) {
+        console.log(`Dhan batch failed: ${e.message} — falling back to Yahoo`);
       }
+    }
 
-      // Stooq third
-      try { results[ticker] = await fetchFromStooq(ticker, exchange); return; }
-      catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}`); }
+    // For any tickers not fetched by Dhan, try Yahoo/Stooq individually
+    const missing = tickers.filter(({ ticker }) => !results[ticker]);
+    if (missing.length) {
+      getNSECookies().catch(() => {});
+      await Promise.all(missing.map(async ({ ticker, exchange }) => {
+        try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
+        catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}`); }
 
-      // AI last resort
-      try { results[ticker] = await fetchFromAI(ticker, exchange); }
-      catch (e3) { console.error(`All price sources failed for ${ticker}: ${e3.message}`); }
-    }));
+        if (exchange === 'NSE') {
+          try { results[ticker] = await fetchFromNSE(ticker, exchange); return; }
+          catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}`); }
+        }
 
-    const found = Object.keys(results).length;
-    console.log(`Prices: ${found}/${tickers.length} fetched`);
+        try { results[ticker] = await fetchFromStooq(ticker, exchange); return; }
+        catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}`); }
+
+        try { results[ticker] = await fetchFromAI(ticker, exchange); }
+        catch (e3) { console.error(`All sources failed for ${ticker}`); }
+      }));
+    }
+
+    console.log(`Prices total: ${Object.keys(results).length}/${tickers.length} fetched`);
     res.json(results);
   } catch (e) {
     res.status(500).json({ error: e.message });
