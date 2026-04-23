@@ -689,14 +689,16 @@ async function fetchFromYahoo(ticker, exchange) {
   if (exchange === 'NSE') symbol = ticker + '.NS';
   else if (exchange === 'BSE') symbol = ticker + '.BO';
 
-  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=5d`;
   const resp = await fetch(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'application/json',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Origin': 'https://finance.yahoo.com',
+      'Referer': 'https://finance.yahoo.com/'
     },
-    signal: AbortSignal.timeout(8000)
+    signal: AbortSignal.timeout(10000)
   });
   if (!resp.ok) throw new Error('Yahoo HTTP ' + resp.status);
   const data = await resp.json();
@@ -772,26 +774,31 @@ app.post('/api/prices', auth, async (req, res) => {
     const { tickers } = req.body;
     const results = {};
 
-    // Warm up NSE session before parallel fetches
-    await getNSECookies();
+    // Try NSE session warmup but don't block on failure
+    getNSECookies().catch(() => {});
 
     await Promise.all(tickers.map(async ({ ticker, exchange }) => {
-      // NSE first for NSE stocks (most reliable)
+      // Yahoo first — NSE frequently blocks cloud server IPs
+      try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
+      catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}`); }
+
+      // NSE second (may work if not blocked)
       if (exchange === 'NSE') {
         try { results[ticker] = await fetchFromNSE(ticker, exchange); return; }
-        catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}, trying Yahoo...`); }
+        catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}`); }
       }
 
-      try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
-      catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}, trying Stooq...`); }
-
+      // Stooq third
       try { results[ticker] = await fetchFromStooq(ticker, exchange); return; }
-      catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}, trying AI...`); }
+      catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}`); }
 
+      // AI last resort
       try { results[ticker] = await fetchFromAI(ticker, exchange); }
-      catch (e3) { console.error(`All price sources failed for ${ticker}`); }
+      catch (e3) { console.error(`All price sources failed for ${ticker}: ${e3.message}`); }
     }));
 
+    const found = Object.keys(results).length;
+    console.log(`Prices: ${found}/${tickers.length} fetched`);
     res.json(results);
   } catch (e) {
     res.status(500).json({ error: e.message });
