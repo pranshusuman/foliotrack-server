@@ -557,13 +557,72 @@ app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
   }
 });
 
-// Get list of unique brokers used by this user
+// Get list of brokers with STATS + HOLDER name (Stage 2)
 app.get('/api/brokers', auth, async (req, res) => {
   try {
-    const { data } = await supabase.from('holdings').select('broker').eq('user_id', req.user.id);
-    const brokers = [...new Set((data || []).map(d => d.broker || 'Main'))];
-    res.json({ brokers: brokers.length ? brokers : ['Main'] });
+    // Fetch all holdings paginated
+    let allHoldings = [];
+    let hFrom = 0;
+    while (true) {
+      const { data } = await supabase.from('holdings').select('*')
+        .eq('user_id', req.user.id).range(hFrom, hFrom + 999);
+      if (!data || data.length === 0) break;
+      allHoldings = allHoldings.concat(data);
+      if (data.length < 1000) break;
+      hFrom += 1000;
+    }
+
+    // Fetch all transactions paginated
+    let allTx = [];
+    let txFrom = 0;
+    while (true) {
+      const { data } = await supabase.from('transactions').select('*')
+        .eq('user_id', req.user.id).range(txFrom, txFrom + 999);
+      if (!data || data.length === 0) break;
+      allTx = allTx.concat(data);
+      if (data.length < 1000) break;
+      txFrom += 1000;
+    }
+
+    // Fetch holder metadata (may not exist if broker_meta table not created yet)
+    let holderMap = {};
+    try {
+      const { data: meta } = await supabase.from('broker_meta').select('*').eq('user_id', req.user.id);
+      (meta || []).forEach(m => { holderMap[m.broker] = m.holder; });
+    } catch {}
+
+    // Build broker stats
+    const brokerNames = new Set();
+    allHoldings.forEach(h => brokerNames.add(h.broker || 'Main'));
+    allTx.forEach(t => brokerNames.add(t.broker || 'Main'));
+
+    const brokers = [];
+    for (const name of brokerNames) {
+      const holdings = allHoldings.filter(h => (h.broker || 'Main') === name);
+      const txs = allTx.filter(t => (t.broker || 'Main') === name);
+      const invested = txs.filter(t => t.type === 'buy').reduce((s, t) => s + Number(t.qty) * Number(t.price), 0);
+      const sold = txs.filter(t => t.type === 'sell').reduce((s, t) => s + Number(t.qty) * Number(t.price), 0);
+      const dates = txs.map(t => t.date).filter(Boolean).sort();
+      brokers.push({
+        name,
+        holder: holderMap[name] || '',
+        holdingsCount: holdings.length,
+        transactionsCount: txs.length,
+        invested: Math.round(invested),
+        sold: Math.round(sold),
+        firstDate: dates[0] || null,
+        lastDate: dates[dates.length - 1] || null
+      });
+    }
+
+    if (!brokers.length) brokers.push({
+      name: 'Main', holder: '', holdingsCount: 0, transactionsCount: 0,
+      invested: 0, sold: 0, firstDate: null, lastDate: null
+    });
+
+    res.json({ brokers });
   } catch (e) {
+    console.error('Brokers fetch error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -575,19 +634,115 @@ app.post('/api/brokers/rename', auth, async (req, res) => {
     if (!oldName || !newName) return res.status(400).json({ error: 'Both names required' });
     await supabase.from('holdings').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
     await supabase.from('transactions').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
+    // Migrate holder meta too
+    try {
+      await supabase.from('broker_meta').update({ broker: newName }).eq('user_id', req.user.id).eq('broker', oldName);
+    } catch {}
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Delete all data for a specific broker (useful for re-import)
+// MERGE brokers — transfer transactions from source to target and rebuild holdings
+app.post('/api/brokers/merge', auth, async (req, res) => {
+  try {
+    const { source, target } = req.body;
+    if (!source || !target) return res.status(400).json({ error: 'Source and target required' });
+    if (source === target) return res.status(400).json({ error: 'Source and target must differ' });
+
+    // Move transactions from source → target (chunked)
+    let moved = 0;
+    while (true) {
+      const { data: batch } = await supabase.from('transactions')
+        .select('id').eq('user_id', req.user.id).eq('broker', source).limit(1000);
+      if (!batch || batch.length === 0) break;
+      await supabase.from('transactions').update({ broker: target }).in('id', batch.map(t => t.id));
+      moved += batch.length;
+      if (batch.length < 1000) break;
+    }
+
+    // Delete old holdings for both
+    await supabase.from('holdings').delete().eq('user_id', req.user.id).in('broker', [source, target]);
+
+    // Fetch target transactions (paginated) and rebuild
+    let allTx = [];
+    let from = 0;
+    while (true) {
+      const { data } = await supabase.from('transactions')
+        .select('*').eq('user_id', req.user.id).eq('broker', target)
+        .order('date', { ascending: true }).range(from, from + 999);
+      if (!data || data.length === 0) break;
+      allTx = allTx.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    const groups = {};
+    allTx.forEach(t => {
+      const key = `${t.ticker}|${t.exchange}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    });
+
+    const newHoldings = [];
+    for (const [key, txs] of Object.entries(groups)) {
+      const [ticker, exchange] = key.split('|');
+      let netQty = 0, totalCost = 0, totalBuyQty = 0, firstBuyDate = null;
+      txs.forEach(t => {
+        const q = Number(t.qty), p = Number(t.price);
+        if (t.type === 'buy') { netQty += q; totalCost += q * p; totalBuyQty += q; if (!firstBuyDate) firstBuyDate = t.date; }
+        else netQty -= q;
+      });
+      const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+      if (netQty > 0.001 && avgCost > 0) {
+        newHoldings.push({
+          user_id: req.user.id, ticker, exchange, broker: target,
+          qty: Math.round(netQty * 1000) / 1000,
+          avg_cost: Math.round(avgCost * 100) / 100,
+          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+        });
+      }
+    }
+
+    if (newHoldings.length) {
+      for (let i = 0; i < newHoldings.length; i += 500) {
+        await supabase.from('holdings').insert(newHoldings.slice(i, i + 500));
+      }
+    }
+
+    res.json({ success: true, transactionsMoved: moved, holdingsRebuilt: newHoldings.length });
+  } catch (e) {
+    console.error('Merge broker error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Set holder name for a broker (Stage 2)
+app.patch('/api/brokers/holder', auth, async (req, res) => {
+  try {
+    const { broker, holder } = req.body;
+    if (!broker) return res.status(400).json({ error: 'Broker required' });
+    try {
+      await supabase.from('broker_meta').upsert({
+        user_id: req.user.id, broker, holder: holder || ''
+      }, { onConflict: 'user_id,broker' });
+      res.json({ success: true });
+    } catch(e) {
+      // Table may not exist — return friendly error
+      res.status(500).json({ error: 'broker_meta table not created. Run migration v3 SQL first.' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Delete all data for a specific broker
 app.delete('/api/brokers/:name', auth, async (req, res) => {
   try {
     const name = req.params.name;
     if (!name) return res.status(400).json({ error: 'Broker name required' });
 
-    // Delete in chunks to bypass Supabase row limits
     let totalTx = 0;
     while (true) {
       const { data: toDelete } = await supabase.from('transactions')
@@ -599,7 +754,6 @@ app.delete('/api/brokers/:name', auth, async (req, res) => {
       if (toDelete.length < 1000) break;
     }
 
-    // Delete all holdings for this broker
     const { data: holdings } = await supabase.from('holdings')
       .select('id').eq('user_id', req.user.id).eq('broker', name);
     const totalH = (holdings || []).length;
@@ -607,9 +761,220 @@ app.delete('/api/brokers/:name', auth, async (req, res) => {
       await supabase.from('holdings').delete().in('id', holdings.map(h => h.id));
     }
 
+    // Delete holder meta too
+    try {
+      await supabase.from('broker_meta').delete().eq('user_id', req.user.id).eq('broker', name);
+    } catch {}
+
     res.json({ success: true, transactionsDeleted: totalTx, holdingsDeleted: totalH });
   } catch (e) {
     console.error('Delete broker error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Server-side XIRR (Stage 2) — for large datasets where client-side is slow
+function xirrNewton(values, dates, guess = 0.1) {
+  if (!values || !dates || values.length !== dates.length || values.length < 2) return null;
+  const d0 = new Date(dates[0]);
+  const years = dates.map(d => (new Date(d) - d0) / (365.25 * 24 * 3600 * 1000));
+  let r = guess;
+  for (let iter = 0; iter < 100; iter++) {
+    let npv = 0, dnpv = 0;
+    for (let i = 0; i < values.length; i++) {
+      const base = Math.pow(1 + r, years[i]);
+      if (!isFinite(base) || base === 0) return null;
+      npv += values[i] / base;
+      dnpv += -years[i] * values[i] / (base * (1 + r));
+    }
+    if (!isFinite(dnpv) || Math.abs(dnpv) < 1e-10) break;
+    const newR = r - npv / dnpv;
+    if (!isFinite(newR)) return null;
+    if (Math.abs(newR - r) < 1e-6) return newR;
+    r = newR;
+  }
+  return r;
+}
+
+app.post('/api/xirr', auth, async (req, res) => {
+  try {
+    const { tickers, livePrices } = req.body;
+    // livePrices: {TICKER: ltp, ...} — client passes current prices
+
+    // Fetch all transactions (paginated)
+    let allTx = [];
+    let from = 0;
+    while (true) {
+      const { data } = await supabase.from('transactions').select('*')
+        .eq('user_id', req.user.id).order('date', { ascending: true }).range(from, from + 999);
+      if (!data || data.length === 0) break;
+      allTx = allTx.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    // Fetch holdings
+    const { data: holdings } = await supabase.from('holdings').select('*').eq('user_id', req.user.id);
+    const holdMap = {};
+    (holdings || []).forEach(h => { holdMap[h.ticker] = h; });
+
+    const today = new Date().toISOString().split('T')[0];
+    const result = { portfolio: null, stocks: {} };
+
+    // Portfolio XIRR
+    const pVals = [], pDates = [];
+    allTx.forEach(t => {
+      pVals.push(t.type === 'buy' ? -(t.qty * t.price) : t.qty * t.price);
+      pDates.push(t.date);
+    });
+    let termVal = 0;
+    (holdings || []).forEach(h => {
+      const ltp = (livePrices && livePrices[h.ticker]) || h.avg_cost;
+      termVal += h.qty * ltp;
+    });
+    if (termVal > 0) { pVals.push(termVal); pDates.push(today); }
+    if (pVals.some(v => v < 0) && pVals.some(v => v > 0)) {
+      const x = xirrNewton(pVals, pDates);
+      if (x !== null && isFinite(x) && x > -0.99 && x < 10) result.portfolio = x * 100;
+    }
+
+    // Stock-wise XIRR (only for held stocks, if tickers filter given)
+    const stocksToCompute = tickers || Object.keys(holdMap);
+    const byTicker = {};
+    allTx.forEach(t => {
+      if (!byTicker[t.ticker]) byTicker[t.ticker] = [];
+      byTicker[t.ticker].push(t);
+    });
+
+    for (const tk of stocksToCompute) {
+      const txs = byTicker[tk] || [];
+      if (!txs.length || !holdMap[tk]) continue;
+      const vals = txs.map(t => t.type === 'buy' ? -(t.qty * t.price) : t.qty * t.price);
+      const dates = txs.map(t => t.date);
+      const ltp = (livePrices && livePrices[tk]) || holdMap[tk].avg_cost;
+      vals.push(holdMap[tk].qty * ltp);
+      dates.push(today);
+      if (vals.some(v => v < 0) && vals.some(v => v > 0)) {
+        const x = xirrNewton(vals, dates);
+        if (x !== null && isFinite(x) && x > -0.99 && x < 10) result.stocks[tk] = x * 100;
+      }
+    }
+
+    res.json(result);
+  } catch (e) {
+    console.error('XIRR error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// SCOPED rebuild — all / broker / stock (Stage 2)
+app.post('/api/portfolio/rebuild-scoped', auth, async (req, res) => {
+  try {
+    const { scope, broker, ticker } = req.body;
+
+    let query = supabase.from('transactions').select('*').eq('user_id', req.user.id);
+    if (scope === 'broker' && broker) query = query.eq('broker', broker);
+    else if (scope === 'stock' && ticker) query = query.eq('ticker', ticker);
+
+    let allTx = [];
+    let from = 0;
+    while (true) {
+      const { data } = await query.order('date', { ascending: true }).range(from, from + 999);
+      if (!data || data.length === 0) break;
+      allTx = allTx.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+
+    // Delete existing holdings for same scope
+    let delQuery = supabase.from('holdings').delete().eq('user_id', req.user.id);
+    if (scope === 'broker' && broker) delQuery = delQuery.eq('broker', broker);
+    else if (scope === 'stock' && ticker) delQuery = delQuery.eq('ticker', ticker);
+    await delQuery;
+
+    const groups = {};
+    allTx.forEach(t => {
+      const key = `${t.ticker}|${t.exchange}|${t.broker || 'Main'}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    });
+
+    const newHoldings = [];
+    for (const [key, txs] of Object.entries(groups)) {
+      const [tk, ex, br] = key.split('|');
+      let netQty = 0, totalCost = 0, totalBuyQty = 0, firstBuyDate = null;
+      txs.forEach(t => {
+        const q = Number(t.qty), p = Number(t.price);
+        if (t.type === 'buy') { netQty += q; totalCost += q * p; totalBuyQty += q; if (!firstBuyDate) firstBuyDate = t.date; }
+        else netQty -= q;
+      });
+      const avgCost = totalBuyQty > 0 ? totalCost / totalBuyQty : 0;
+      if (netQty > 0.001 && avgCost > 0) {
+        newHoldings.push({
+          user_id: req.user.id, ticker: tk, exchange: ex, broker: br,
+          qty: Math.round(netQty * 1000) / 1000,
+          avg_cost: Math.round(avgCost * 100) / 100,
+          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
+        });
+      }
+    }
+
+    if (newHoldings.length) {
+      for (let i = 0; i < newHoldings.length; i += 500) {
+        await supabase.from('holdings').insert(newHoldings.slice(i, i + 500));
+      }
+    }
+
+    res.json({ success: true, rebuilt: newHoldings.length, transactionsProcessed: allTx.length });
+  } catch (e) {
+    console.error('Rebuild scoped error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// TICKER CACHE endpoints (Stage 2)
+app.get('/api/ticker-cache', auth, async (req, res) => {
+  try {
+    let allRows = [];
+    let from = 0;
+    while (true) {
+      const { data, error } = await supabase.from('ticker_cache')
+        .select('company_name, ticker').range(from, from + 999);
+      if (error) throw error;
+      if (!data || data.length === 0) break;
+      allRows = allRows.concat(data);
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    const map = {};
+    allRows.forEach(r => { map[r.company_name] = r.ticker; });
+    res.json({ map });
+  } catch (e) {
+    // Table may not exist yet
+    res.json({ map: {} });
+  }
+});
+
+app.post('/api/ticker-cache', auth, async (req, res) => {
+  try {
+    const { mappings } = req.body;
+    if (!mappings || typeof mappings !== 'object') return res.status(400).json({ error: 'Invalid' });
+    const rows = Object.entries(mappings)
+      .filter(([k, v]) => k && v && v !== 'UNKNOWN')
+      .map(([k, v]) => ({
+        company_name: k.toLowerCase().trim(),
+        ticker: v.toUpperCase().trim(),
+        verified: false
+      }));
+    if (rows.length) {
+      try {
+        await supabase.from('ticker_cache').upsert(rows, { onConflict: 'company_name' });
+      } catch(e) {
+        return res.status(500).json({ error: 'ticker_cache table not created. Run migration v3 SQL.' });
+      }
+    }
+    res.json({ success: true, saved: rows.length });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
@@ -688,10 +1053,8 @@ const DHAN_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
 const DHAN_CLIENT_ID = process.env.DHAN_CLIENT_ID || '1000000290';
 
 async function fetchFromDhan(tickers) {
-  // tickers: [{ticker, exchange}, ...]
   if (!DHAN_TOKEN) throw new Error('No Dhan token');
 
-  // Group by segment
   const nse = tickers.filter(t => t.exchange === 'NSE').map(t => t.ticker);
   const bse = tickers.filter(t => t.exchange === 'BSE').map(t => t.ticker);
 
@@ -700,7 +1063,8 @@ async function fetchFromDhan(tickers) {
   if (bse.length) body['BSE_EQ'] = bse;
   if (!Object.keys(body).length) throw new Error('No valid tickers');
 
-  const resp = await fetch('https://api.dhan.co/v2/marketfeed/ltp', {
+  // Use /quote endpoint — returns OHLC so we can compute day change
+  const resp = await fetch('https://api.dhan.co/v2/marketfeed/quote', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -708,7 +1072,7 @@ async function fetchFromDhan(tickers) {
       'client-id': DHAN_CLIENT_ID
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10000)
+    signal: AbortSignal.timeout(15000)
   });
 
   if (!resp.ok) {
@@ -716,22 +1080,28 @@ async function fetchFromDhan(tickers) {
     throw new Error(`Dhan HTTP ${resp.status}: ${txt.substring(0, 100)}`);
   }
 
-  const data = await resp.json();
-  // Response format: { "NSE_EQ": { "RELIANCE": { "last_price": 2400.5 }, ... }, ... }
+  const json = await resp.json();
+  const data = json.data || json;
   const results = {};
 
   for (const [segment, stocks] of Object.entries(data)) {
-    for (const [ticker, info] of Object.entries(stocks || {})) {
+    if (!stocks || typeof stocks !== 'object') continue;
+    for (const [ticker, info] of Object.entries(stocks)) {
+      if (!info || typeof info !== 'object') continue;
       const ltp = info.last_price || info.ltp || 0;
-      const prevClose = info.prev_close || info.close || ltp;
-      const dayPct = prevClose ? ((ltp - prevClose) / prevClose) * 100 : 0;
-      results[ticker] = {
-        ltp, prev_close: prevClose,
-        day_change_pct: Math.round(dayPct * 100) / 100,
-        currency: 'INR',
-        market_state: 'LIVE',
-        source: 'dhan'
-      };
+      // Dhan quote response: ohlc.close is PREVIOUS day's close
+      const prevClose = info.ohlc?.close || info.prev_close || ltp;
+      const dayPct = prevClose && prevClose !== ltp ? ((ltp - prevClose) / prevClose) * 100 : 0;
+      if (ltp > 0) {
+        results[ticker] = {
+          ltp,
+          prev_close: prevClose,
+          day_change_pct: Math.round(dayPct * 100) / 100,
+          currency: 'INR',
+          market_state: 'LIVE',
+          source: 'dhan'
+        };
+      }
     }
   }
   return results;
@@ -943,6 +1313,21 @@ app.post('/api/ai/news', auth, async (req, res) => {
 });
 
 // Answer any portfolio question
+// Helper: detect credit/auth errors and return friendly message
+function parseAIError(e) {
+  const msg = e.message || '';
+  if (msg.includes('credit balance is too low') || msg.includes('insufficient_quota')) {
+    return { friendly: 'AI features unavailable — please top up Anthropic API credits at console.anthropic.com/settings/billing', code: 'credits_exhausted' };
+  }
+  if (msg.includes('rate_limit') || msg.includes('429')) {
+    return { friendly: 'AI is rate-limited — please wait a minute and try again', code: 'rate_limit' };
+  }
+  if (msg.includes('invalid_api_key') || msg.includes('authentication')) {
+    return { friendly: 'AI not configured — check ANTHROPIC_API_KEY on server', code: 'auth' };
+  }
+  return { friendly: msg, code: 'unknown' };
+}
+
 app.post('/api/ai/ask', auth, async (req, res) => {
   try {
     const { question, tickers } = req.body;
@@ -955,7 +1340,8 @@ app.post('/api/ai/ask', auth, async (req, res) => {
     const text = response.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
     res.json({ answer: text });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    const parsed = parseAIError(e);
+    res.status(500).json({ error: parsed.friendly, code: parsed.code });
   }
 });
 
@@ -991,9 +1377,7 @@ Return format (JSON only, no other text):
       }]
     });
     let text = response.content.filter(c => c.type === 'text').map(c => c.text).join('\n').trim();
-    // Strip markdown code fences if present
     text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    // Extract JSON object if surrounded by other text
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) text = jsonMatch[0];
     let map = {};
@@ -1003,8 +1387,9 @@ Return format (JSON only, no other text):
     }
     res.json({ map });
   } catch (e) {
-    console.error('Ticker lookup error:', e);
-    res.status(500).json({ error: e.message });
+    const parsed = parseAIError(e);
+    console.error('Ticker lookup error:', parsed.friendly);
+    res.status(500).json({ error: parsed.friendly, code: parsed.code });
   }
 });
 
