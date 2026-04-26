@@ -363,94 +363,6 @@ app.post('/api/portfolio/import', auth, async (req, res) => {
   }
 });
 
-// REBUILD ALL HOLDINGS from scratch based on ALL transactions
-// Use this when holdings are out of sync with transactions
-app.post('/api/portfolio/rebuild', auth, async (req, res) => {
-  try {
-    console.log(`🔨 Rebuilding all holdings for user ${req.user.id}...`);
-
-    // Step 1: Fetch ALL transactions (paginated)
-    let allTxs = [];
-    let from = 0;
-    while (true) {
-      const { data, error } = await supabase
-        .from('transactions').select('*')
-        .eq('user_id', req.user.id)
-        .order('date', { ascending: true })
-        .range(from, from + 999);
-      if (error) throw error;
-      if (!data || data.length === 0) break;
-      allTxs = allTxs.concat(data);
-      if (data.length < 1000) break;
-      from += 1000;
-    }
-
-    console.log(`Found ${allTxs.length} transactions to process`);
-
-    // Step 2: Group by ticker+exchange+broker
-    const groups = {};
-    allTxs.forEach(t => {
-      const key = `${t.ticker}|${t.exchange}|${t.broker || 'Main'}`;
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(t);
-    });
-
-    // Step 3: Delete ALL existing holdings
-    await supabase.from('holdings').delete().eq('user_id', req.user.id);
-
-    // Step 4: Recompute and insert fresh holdings
-    let rebuilt = 0, closed = 0;
-    const newHoldings = [];
-
-    for (const [key, txs] of Object.entries(groups)) {
-      const [ticker, exchange, broker] = key.split('|');
-      let netQty = 0, totalBuyCost = 0, totalBuyQty = 0, firstBuyDate = null;
-
-      txs.forEach(t => {
-        const q = Number(t.qty), p = Number(t.price);
-        if (t.type === 'buy') {
-          netQty += q;
-          totalBuyCost += q * p;
-          totalBuyQty += q;
-          if (!firstBuyDate) firstBuyDate = t.date;
-        } else {
-          netQty -= q;
-        }
-      });
-
-      const avgCost = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
-
-      if (netQty > 0.001 && avgCost > 0) {
-        newHoldings.push({
-          user_id: req.user.id,
-          ticker, exchange, broker,
-          qty: Math.round(netQty * 1000) / 1000,
-          avg_cost: Math.round(avgCost * 100) / 100,
-          buy_date: firstBuyDate || new Date().toISOString().split('T')[0]
-        });
-        rebuilt++;
-      } else {
-        closed++;
-      }
-    }
-
-    // Bulk insert all new holdings
-    if (newHoldings.length > 0) {
-      const chunkSize = 500;
-      for (let i = 0; i < newHoldings.length; i += chunkSize) {
-        const { error } = await supabase.from('holdings').insert(newHoldings.slice(i, i + chunkSize));
-        if (error) throw error;
-      }
-    }
-
-    console.log(`✅ Rebuilt ${rebuilt} holdings, ${closed} fully closed positions`);
-    res.json({ success: true, rebuilt, closed, total: allTxs.length });
-
-  } catch (e) {
-    console.error('Rebuild error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
 // Fixed: sequential holding rebuild to avoid race conditions
 app.post('/api/portfolio/transactions/bulk', auth, async (req, res) => {
   try {
@@ -1018,7 +930,6 @@ async function getNSECookies() {
       return nseCookies;
     }
   } catch (e) {
-    console.log('NSE cookie fetch failed:', e.message);
   }
   return null;
 }
@@ -1212,35 +1123,31 @@ app.post('/api/prices', auth, async (req, res) => {
         const dhanResults = await fetchFromDhan(tickers);
         Object.assign(results, dhanResults);
         const found = Object.keys(dhanResults).length;
-        console.log(`Dhan: ${found}/${tickers.length} prices fetched`);
         // For any tickers Dhan missed, fall through to Yahoo below
       } catch (e) {
-        console.log(`Dhan batch failed: ${e.message} — falling back to Yahoo`);
       }
     }
 
-    // For any tickers not fetched by Dhan, try Yahoo/Stooq individually
+    // For any tickers not fetched by Dhan, try Yahoo/NSE/Stooq individually
     const missing = tickers.filter(({ ticker }) => !results[ticker]);
     if (missing.length) {
-      getNSECookies().catch(() => {});
       await Promise.all(missing.map(async ({ ticker, exchange }) => {
         try { results[ticker] = await fetchFromYahoo(ticker, exchange); return; }
-        catch (e1) { console.log(`Yahoo failed for ${ticker}: ${e1.message}`); }
+        catch (e1) { /* try next */ }
 
         if (exchange === 'NSE') {
           try { results[ticker] = await fetchFromNSE(ticker, exchange); return; }
-          catch (e0) { console.log(`NSE failed for ${ticker}: ${e0.message}`); }
+          catch (e0) { /* try next */ }
         }
 
         try { results[ticker] = await fetchFromStooq(ticker, exchange); return; }
-        catch (e2) { console.log(`Stooq failed for ${ticker}: ${e2.message}`); }
+        catch (e2) { /* try next */ }
 
         try { results[ticker] = await fetchFromAI(ticker, exchange); }
-        catch (e3) { console.error(`All sources failed for ${ticker}`); }
+        catch (e3) { /* all sources failed */ }
       }));
     }
 
-    console.log(`Prices total: ${Object.keys(results).length}/${tickers.length} fetched`);
     res.json(results);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1280,7 +1187,6 @@ If the image is unclear or has no stock data, return: []`;
       messages: [{ role: 'user', content }]
     });
     const text = response.content.filter(c => c.type === 'text').map(c => c.text).join('');
-    console.log('AI raw response:', text.substring(0, 500));
 
     // Try to extract JSON array even if surrounded by other text
     let cleaned = text.replace(/```json|```/g, '').trim();
