@@ -12,7 +12,15 @@ const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
-app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
+app.use(cors({
+  origin: [
+    'https://foliotrack.pages.dev',
+    'https://playful-cat-873d92.netlify.app',
+    'http://localhost:3000',
+    'http://localhost:5173'
+  ],
+  credentials: true
+}));
 app.use(express.json({ limit: '20mb' }));
 
 // ── Clients ────────────────────────────────────────────────────────────────
@@ -651,18 +659,18 @@ app.post('/api/brokers/merge', auth, async (req, res) => {
     if (!source || !target) return res.status(400).json({ error: 'Source and target required' });
     if (source === target) return res.status(400).json({ error: 'Source and target must differ' });
 
-    // Move transactions from source → target (chunked)
-    let moved = 0;
-    while (true) {
-      const { data: batch } = await supabase.from('transactions')
-        .select('id').eq('user_id', req.user.id).eq('broker', source).limit(1000);
-      if (!batch || batch.length === 0) break;
-      await supabase.from('transactions').update({ broker: target }).in('id', batch.map(t => t.id));
-      moved += batch.length;
-      if (batch.length < 1000) break;
-    }
+    // Count how many will move (for response metrics)
+    const { count: moved } = await supabase.from('transactions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.user.id).eq('broker', source);
 
-    // Delete old holdings for both
+    // Move transactions from source → target in ONE call
+    const { error: updErr } = await supabase.from('transactions')
+      .update({ broker: target })
+      .eq('user_id', req.user.id).eq('broker', source);
+    if (updErr) throw updErr;
+
+    // Delete old holdings for both (will rebuild below)
     await supabase.from('holdings').delete().eq('user_id', req.user.id).in('broker', [source, target]);
 
     // Fetch target transactions (paginated) and rebuild
@@ -711,7 +719,7 @@ app.post('/api/brokers/merge', auth, async (req, res) => {
       }
     }
 
-    res.json({ success: true, transactionsMoved: moved, holdingsRebuilt: newHoldings.length });
+    res.json({ success: true, transactionsMoved: moved || 0, holdingsRebuilt: newHoldings.length });
   } catch (e) {
     console.error('Merge broker error:', e);
     res.status(500).json({ error: e.message });
@@ -737,36 +745,36 @@ app.patch('/api/brokers/holder', auth, async (req, res) => {
   }
 });
 
-// Delete all data for a specific broker
+// Delete all data for a specific broker — FAST single-call delete
 app.delete('/api/brokers/:name', auth, async (req, res) => {
   try {
     const name = req.params.name;
     if (!name) return res.status(400).json({ error: 'Broker name required' });
 
-    let totalTx = 0;
-    while (true) {
-      const { data: toDelete } = await supabase.from('transactions')
-        .select('id').eq('user_id', req.user.id).eq('broker', name).limit(1000);
-      if (!toDelete || toDelete.length === 0) break;
-      const ids = toDelete.map(t => t.id);
-      await supabase.from('transactions').delete().in('id', ids);
-      totalTx += toDelete.length;
-      if (toDelete.length < 1000) break;
-    }
+    // Count first (for response metrics) — much faster than fetching all rows
+    const { count: txCount } = await supabase.from('transactions')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.user.id).eq('broker', name);
+    const { count: hCount } = await supabase.from('holdings')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.user.id).eq('broker', name);
 
-    const { data: holdings } = await supabase.from('holdings')
-      .select('id').eq('user_id', req.user.id).eq('broker', name);
-    const totalH = (holdings || []).length;
-    if (totalH > 0) {
-      await supabase.from('holdings').delete().in('id', holdings.map(h => h.id));
-    }
+    // Direct delete — Supabase handles this server-side, no 1000-row limit needed
+    const { error: txErr } = await supabase.from('transactions').delete()
+      .eq('user_id', req.user.id).eq('broker', name);
+    if (txErr) throw txErr;
+
+    const { error: hErr } = await supabase.from('holdings').delete()
+      .eq('user_id', req.user.id).eq('broker', name);
+    if (hErr) throw hErr;
 
     // Delete holder meta too
     try {
-      await supabase.from('broker_meta').delete().eq('user_id', req.user.id).eq('broker', name);
+      await supabase.from('broker_meta').delete()
+        .eq('user_id', req.user.id).eq('broker', name);
     } catch {}
 
-    res.json({ success: true, transactionsDeleted: totalTx, holdingsDeleted: totalH });
+    res.json({ success: true, transactionsDeleted: txCount || 0, holdingsDeleted: hCount || 0 });
   } catch (e) {
     console.error('Delete broker error:', e);
     res.status(500).json({ error: e.message });
